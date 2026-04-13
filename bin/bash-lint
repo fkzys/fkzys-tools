@@ -1,0 +1,701 @@
+#!/bin/bash
+# bash-lint — linter for fkzys ecosystem bash projects
+#
+# Checks shell scripts against ecosystem conventions defined in specs/README.md.
+# Produces structured output: LEVEL:file:line:message
+#
+# Usage: bash-lint [OPTIONS] [FILES...]
+#   -p, --project DIR     Scan entire project (auto-discovers bin/, lib/, tests/)
+#   --strict              Treat warnings as errors
+#   --json                Output in JSON format
+#   --quiet               Suppress INFO messages
+#   -h, --help            Show help
+#   -V, --version         Show version
+
+set -uo pipefail
+# Note: no -e. Linter must continue scanning all files even when individual checks fail.
+
+readonly VERSION="0.1.0"
+
+# ── Output formatting ──────────────────────────────────────────────
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── State ──────────────────────────────────────────────────────────
+
+STRICT=0
+JSON_OUTPUT=0
+QUIET=0
+declare -a FILES=()
+declare -a ERRORS=()
+declare -a WARNINGS=()
+declare -a INFOS=()
+
+# ── Helpers ────────────────────────────────────────────────────────
+
+error()   { ERRORS+=("$1"); }
+warning() { WARNINGS+=("$1"); }
+info()    { [[ $QUIET -eq 0 ]] && INFOS+=("$1") || true; }
+
+file_type() {
+    local f="$1"
+
+    # Determine by path pattern
+    case "$f" in
+        */tests/*|*/test_*.sh) echo "test"; return ;;
+        */lib/*.sh)             echo "library"; return ;;
+        */bin/*|*"-lint")       echo "entry"; return ;;
+    esac
+
+    # Fallback: inspect content
+    # Check if it's sourced (has functions but no shebang or no main)
+    if grep -qE '^(ok|fail|assert_|section|summary)\(\)' "$f" 2>/dev/null; then
+        echo "test"
+    elif grep -qE '^(make_mock|reset_.*_globals|test_harness)' "$f" 2>/dev/null; then
+        echo "test"
+    else
+        echo "unknown"
+    fi
+}
+
+line_number_for_pattern() {
+    local file="$1" pattern="$2"
+    grep -nE "$pattern" "$file" 2>/dev/null | head -1 | cut -d: -f1
+}
+
+has_pattern() {
+    local file="$1" pattern="$2"
+    grep -qE "$pattern" "$file" 2>/dev/null
+}
+
+count_pattern() {
+    local file="$1" pattern="$2"
+    grep -cE "$pattern" "$file" 2>/dev/null || echo "0"
+}
+
+# ── Checkers ───────────────────────────────────────────────────────
+
+check_strictness() {
+    local file="$1" ftype="$2"
+
+    case "$ftype" in
+        entry)
+            # Entry points MUST have set -euo pipefail (spec §2)
+            if ! has_pattern "$file" '^set -euo pipefail$'; then
+                local ln
+                ln=$(line_number_for_pattern "$file" '^set -[a-z]+')
+                if [[ -n "$ln" ]]; then
+                    local actual
+                    actual=$(sed -n "${ln}p" "$file")
+                    # Exception: guard scripts with explanatory comment (spec §2)
+                    if echo "$actual" | grep -qE 'set -[a-z]*[a-zA-Z]'; then
+                        local next_line
+                        next_line=$(sed -n "$((ln + 1))p" "$file")
+                        if echo "$actual $next_line" | grep -qiE '(guard|guard script|errexit|set -e|no -e)'; then
+                            return  # guard script — allowed omission
+                        fi
+                        # Has set -something but not -euo pipefail
+                        if [[ $STRICT -eq 1 ]]; then
+                            error "${file}:${ln}:ENTRY_STRICTNESS:entry point must use 'set -euo pipefail' (found: '${actual}')"
+                        else
+                            warning "${file}:${ln}:ENTRY_STRICTNESS:entry point should use 'set -euo pipefail' (found: '${actual}')"
+                        fi
+                    fi
+                else
+                    # No set -... at all — check for guard script comment
+                    local header
+                    header=$(head -15 "$file" 2>/dev/null || true)
+                    if echo "$header" | grep -qiE '(guard script|guard hook|no.*set -euo|no.*errexit|breaks? with errexit)'; then
+                        return  # guard script — allowed omission (spec §2)
+                    fi
+                    error "${file}:1:ENTRY_STRICTNESS:entry point must use 'set -euo pipefail'"
+                fi
+            fi
+            ;;
+        test)
+            # Test files MUST NOT have -e (spec §7, §2 exception)
+            # Only flag set statements in the file header (first 15 lines) — deeper ones are likely inside heredocs
+            local set_line
+            set_line=$(line_number_for_pattern "$file" '^set -euo pipefail$')
+            if [[ -n "$set_line" ]] && [[ "$set_line" -le 15 ]]; then
+                warning "${file}:${set_line}:TEST_HAS_ERREXIT:test file should NOT use 'set -euo pipefail' (use 'set -uo pipefail' — failures must be countable)"
+            fi
+            ;;
+        library)
+            # Libraries should NOT set errexit (they are sourced)
+            if has_pattern "$file" '^set -euo pipefail$'; then
+                local ln
+                ln=$(line_number_for_pattern "$file" '^set -euo pipefail$')
+                warning "${file}:${ln}:LIBRARY_STRICTNESS:library file should not use 'set -euo pipefail' (it is sourced by other scripts)"
+            fi
+            ;;
+    esac
+}
+
+check_shebang() {
+    local file="$1" ftype="$2"
+    local first
+    first="$(head -1 "$file")"
+
+    case "$ftype" in
+        entry)
+            if [[ "$first" != "#!/bin/bash" ]]; then
+                info "${file}:1:SHEBANG:entry point should use '#!/bin/bash' (found: '${first}')"
+            fi
+            ;;
+        library|test)
+            if [[ "$first" != "#!/usr/bin/env bash" ]]; then
+                info "${file}:1:SHEBANG:${ftype} should use '#!/usr/bin/env bash' (found: '${first}')"
+            fi
+            ;;
+    esac
+}
+
+check_verify_lib() {
+    local file="$1" ftype="$2"
+
+    # Entry points MUST source via verify-lib + _src() (spec §2, §5)
+    # Exception: guard scripts called by pacman hook may source libraries differently (spec §2)
+    if [[ "$ftype" == "entry" ]]; then
+        local header
+        header=$(head -15 "$file" 2>/dev/null || true)
+        if echo "$header" | grep -qiE '(guard script|guard hook|no.*set -euo|no.*errexit|breaks? with errexit)'; then
+            return  # guard script — relaxed entry requirements
+        fi
+        if ! has_pattern "$file" 'verify-lib'; then
+            local ln
+            ln=$(line_number_for_pattern "$file" 'source|_src')
+            ln="${ln:-1}"
+            error "${file}:${ln}:VERIFY_LIB:entry point must source libraries through 'verify-lib' (TOCTOU protection)"
+        fi
+        if ! has_pattern "$file" '_src\(\)'; then
+            local ln
+            ln=$(line_number_for_pattern "$file" 'source|_src')
+            ln="${ln:-1}"
+            error "${file}:${ln}:VERIFY_LIB:entry point should define '_src()' helper for secure library sourcing"
+        fi
+    fi
+
+    # Libraries should NOT call verify-lib themselves (they are sourced, not entry)
+    if [[ "$ftype" == "library" ]]; then
+        if has_pattern "$file" 'verify-lib'; then
+            local ln
+            ln=$(line_number_for_pattern "$file" 'verify-lib')
+            ln="${ln:-1}"
+            info "${file}:${ln}:VERIFY_LIB:library files are sourced through verify-lib by entry points (direct call unnecessary)"
+        fi
+    fi
+}
+
+check_no_init() {
+    local file="$1" ftype="$2"
+
+    # Entry points that source libraries should set _*_NO_INIT for fast --help (spec §2)
+    if [[ "$ftype" == "entry" ]]; then
+        if has_pattern "$file" '_src.*common\.sh' || has_pattern "$file" 'source.*common\.sh'; then
+            if ! has_pattern "$file" '_[A-Z]+_NO_INIT=1'; then
+                warning "${file}:NO_INIT:entry point should set '_*_NO_INIT=1' before sourcing library to skip auto-initialization (faster --help, test isolation)"
+            fi
+        fi
+    fi
+}
+
+check_config_eval() {
+    local file="$1" ftype="$2"
+
+    # Tests legitimately use eval for function patching/mocking
+    [[ "$ftype" == "test" ]] && return
+
+    # MUST NOT use eval for config (spec §2)
+    # Match eval as a command (start of line or after whitespace), not inside strings
+    if has_pattern "$file" '^[[:space:]]*(eval |eval$)'; then
+        local ln
+        ln=$(line_number_for_pattern "$file" '^[[:space:]]*(eval |eval$)')
+        error "${file}:${ln}:CONFIG_EVAL:must NOT use 'eval' for config parsing (use whitelist + printf -v)"
+    fi
+}
+
+check_config_whitelist() {
+    local file="$1"
+
+    # Config loading should use whitelist pattern
+    # Match only function definitions at start of line (not calls, not comments)
+    if has_pattern "$file" '^[[:space:]]*(function[[:space:]]+)?_?load_config\(\)'; then
+        if ! has_pattern "$file" 'allowed=\('; then
+            warning "${file}:CONFIG_WHITELIST:load_config() should use a key whitelist (local -a allowed=(...))"
+        fi
+        if ! has_pattern "$file" 'printf -v'; then
+            warning "${file}:CONFIG_PRINTF:load_config() should use 'printf -v' for safe variable assignment instead of eval"
+        fi
+    fi
+}
+
+check_config_ownership() {
+    local file="$1"
+
+    # Config loading should check ownership
+    # Match only function definitions at start of line (not calls, not comments)
+    if has_pattern "$file" '^[[:space:]]*(function[[:space:]]+)?_?load_config\(\)'; then
+        if ! has_pattern "$file" 'stat -c %u|stat --format=%u'; then
+            warning "${file}:CONFIG_OWNERSHIP:load_config() should verify config file ownership (stat -c %u)"
+        fi
+    fi
+}
+
+check_cleanup_trap() {
+    local file="$1" ftype="$2"
+
+    # Entry points with side effects should have cleanup trap
+    if [[ "$ftype" == "entry" ]]; then
+        if has_pattern "$file" 'mktemp|mkdir.*TEMP|mktemp -d'; then
+            if ! has_pattern "$file" 'trap.*EXIT|trap.*cleanup'; then
+                warning "${file}:CLEANUP_TRAP:entry point creates temp resources but has no 'trap ... EXIT' for cleanup"
+            fi
+        fi
+    fi
+
+    # Cleanup functions should set +e
+    # Match only function definitions (not comments, not calls)
+    if has_pattern "$file" '^[[:space:]]*(function[[:space:]]+)?cleanup\(\)'; then
+        # Extract from cleanup() definition to the matching closing brace
+        # Use a two-pass approach: find start line, then extract with brace counting
+        local start_line
+        start_line=$(grep -nE '^[[:space:]]*(function[[:space:]]+)?cleanup\(\)' "$file" 2>/dev/null | head -1 | cut -d: -f1)
+        if [[ -n "$start_line" ]]; then
+            local cleanup_body
+            cleanup_body=$(awk -v start="$start_line" 'NR>=start{print; d+=gsub(/{/,"&")-gsub(/}/,"&"); if(d<=0 && NR>start) exit}' "$file")
+            if ! echo "$cleanup_body" | grep -q 'set +e'; then
+                warning "${file}:CLEANUP_ERREXIT:cleanup() should use 'set +e' to prevent errexit from masking errors during cleanup"
+            fi
+        fi
+    fi
+}
+
+check_error_stderr() {
+    local file="$1"
+
+    # ERROR/WARN messages should go to stderr
+    # Anchor pattern to require ERROR/WARN at start of the string argument
+    local bad_errors
+    bad_errors=$(grep -nE '(echo|printf) +['"'"'"]?(ERROR|WARN):' "$file" 2>/dev/null | grep -vE '>& *2|2>' | head -5 || true)
+    if [[ -n "$bad_errors" ]]; then
+        while IFS= read -r line; do
+            local ln
+            ln="$(echo "$line" | cut -d: -f1)"
+            error "${file}:${ln}:ERROR_STDERR:ERROR messages must redirect to stderr (>&2)"
+        done <<< "$bad_errors"
+    fi
+}
+
+check_input_validation() {
+    local file="$1" ftype="$2"
+
+    # Library files handling paths should validate input
+    if [[ "$ftype" == "library" ]]; then
+        if has_pattern "$file" 'install.*DESTDIR|cp.*DESTDIR|mkdir.*DESTDIR'; then
+            if ! has_pattern "$file" '_validate_path|validate_path'; then
+                warning "${file}:INPUT_VALIDATION:library handling install paths should validate with _validate_path()"
+            fi
+        fi
+    fi
+}
+
+check_readonly() {
+    local file="$1"
+
+    # Constants should be readonly
+    if has_pattern "$file" 'readonly VERSION='; then
+        # Good — already using readonly
+        return
+    fi
+    if has_pattern "$file" '^VERSION='; then
+        local ln
+        ln=$(line_number_for_pattern "$file" '^VERSION=')
+        info "${file}:${ln}:READONLY:VERSION constant should use 'readonly VERSION=...'"
+    fi
+}
+
+check_nameref() {
+    local file="$1" ftype="$2"
+
+    # Library functions building arrays should use nameref (bwrap-common pattern)
+    if [[ "$ftype" == "library" ]]; then
+        if has_pattern "$file" 'local -[aA]' && ! has_pattern "$file" 'local -n'; then
+            warning "${file}:NAMEREF:library function builds arrays without using 'local -n' (nameref) for cleaner indirect access"
+        fi
+    fi
+}
+
+check_shopt_restore() {
+    local file="$1"
+
+    # shopt changes should be saved/restored (spec §2)
+    local shopt_lines
+    shopt_lines=$(grep -nE 'shopt -(s|u) ' "$file" 2>/dev/null || true)
+    if [[ -n "$shopt_lines" ]]; then
+        # Check if there's a corresponding restore
+        local shopt_vars
+        shopt_vars=$(grep -oE 'shopt -(s|u) [a-z_]+' "$file" 2>/dev/null | awk '{print $3}' | sort -u)
+        for var in $shopt_vars; do
+            # Count occurrences — if only 1, no restore
+            local cnt
+            cnt=$(count_pattern "$file" "shopt -(s|u) ${var}")
+            if [[ "$cnt" -eq 1 ]]; then
+                local ln
+                ln=$(line_number_for_pattern "$file" "shopt -(s|u) ${var}")
+                warning "${file}:${ln}:SHOPT_RESTORE:shopt '${var}' changed without save/restore (use _had_${var}=false pattern)"
+            fi
+        done
+    fi
+}
+
+check_function_naming() {
+    local file="$1"
+
+    # Functions should be snake_case; internal helpers prefixed with _
+    # Allow leading whitespace to catch functions inside conditional blocks
+    local func_defs
+    func_defs=$(grep -nE '^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*\(\)' "$file" 2>/dev/null || true)
+    if [[ -n "$func_defs" ]]; then
+        while IFS= read -r line; do
+            local ln fname
+            ln="$(echo "$line" | cut -d: -f1)"
+            fname="$(echo "$line" | sed 's/^[0-9]*:\([a-zA-Z_][a-zA-Z0-9_]*\)(.*/\1/')"
+            # Check for CamelCase
+            if echo "$fname" | grep -qE '[A-Z]'; then
+                warning "${file}:${ln}:FUNCTION_NAMING:function '${fname}' should use snake_case (not CamelCase)"
+            fi
+        done <<< "$func_defs"
+    fi
+}
+
+check_cli_conventions() {
+    local file="$1" ftype="$2"
+
+    if [[ "$ftype" == "entry" ]]; then
+        # Should support --help/-h
+        if ! has_pattern "$file" '\-\-help|\-h\)' && ! has_pattern "$file" 'show_help|print_usage'; then
+            warning "${file}:CLI_HELP:entry point should support --help/-h (spec §2)"
+        fi
+
+        # Should support --version/-V
+        if ! has_pattern "$file" '\-\-version|\-V\)' && ! has_pattern "$file" 'VERSION'; then
+            warning "${file}:CLI_VERSION:entry point should support --version/-V (spec §2)"
+        fi
+    fi
+}
+
+check_dangerous_patterns() {
+    local file="$1" ftype="$2"
+
+    # chmod 777
+    if has_pattern "$file" 'chmod 777|chmod -?777'; then
+        local ln
+        ln=$(line_number_for_pattern "$file" 'chmod 777|chmod -?777')
+        error "${file}:${ln}:CHMOD_777:must NOT use chmod 777 (world-writable)"
+    fi
+
+    # /tmp usage for scripts (should use SecureDir / XDG_RUNTIME_DIR)
+    if has_pattern "$file" 'mktemp\b|TMPDIR=/tmp|TEMPDIR=/tmp'; then
+        local ln
+        ln=$(line_number_for_pattern "$file" 'mktemp\b|TMPDIR=/tmp|TEMPDIR=/tmp')
+        warning "${file}:${ln}:TMP_USAGE:avoid /tmp for script files (race condition); prefer XDG_RUNTIME_DIR or state dir"
+    fi
+
+    # Hardcoded secrets (exclude comments)
+    if has_pattern "$file" '^[^#]*(password|secret|token|api_key)\s*=\s*"[A-Za-z0-9+/=_-]{16,}"' 2>/dev/null; then
+        local ln
+        ln=$(line_number_for_pattern "$file" '^[^#]*(password|secret|token|api_key)')
+        error "${file}:${ln}:HARDCODED_SECRET:must NOT hardcode secrets/passwords/tokens"
+    fi
+
+    # Source without verify-lib — skip for test files (tests source libraries directly in controlled env)
+    if [[ "$ftype" != "test" ]]; then
+        # Flag sourcing of literal paths (quoted strings or absolute paths), allow bare variable sourcing
+        if has_pattern "$file" '^[^#]*source\s+["'"'"'/]' && ! has_pattern "$file" 'verify-lib'; then
+            # Only flag in entry points where library sourcing is expected
+            if has_pattern "$file" 'common\.sh|package\.sh|sandbox\.sh'; then
+                local ln
+                ln=$(line_number_for_pattern "$file" '^[^#]*source\s+')
+                if [[ -n "$ln" ]]; then
+                    warning "${file}:${ln}:SOURCE_UNSAFE:sourcing without verify-lib wrapper (use _src() helper)"
+                fi
+            fi
+        fi
+    fi
+}
+
+check_glob_safety() {
+    local file="$1"
+
+    # Globbing should use nullglob
+    if has_pattern "$file" 'for .* in \*|for .* in .*\/\*'; then
+        if ! has_pattern "$file" 'nullglob|noglob'; then
+            local ln
+            ln=$(line_number_for_pattern "$file" 'for .* in \*|for .* in .*\/\*')
+            if [[ -n "$ln" ]]; then
+                warning "${file}:${ln}:GLOB_NULLGLOB:globbing loop should set 'shopt -s nullglob' to prevent literal pattern expansion"
+            fi
+        fi
+    fi
+}
+
+# ── Main analysis ──────────────────────────────────────────────────
+
+analyze_file() {
+    local file="$1"
+    local ftype
+    ftype="$(file_type "$file")"
+
+    check_strictness "$file" "$ftype"
+    check_shebang "$file" "$ftype"
+    check_verify_lib "$file" "$ftype"
+    check_no_init "$file" "$ftype"
+    check_config_eval "$file" "$ftype"
+    check_config_whitelist "$file"
+    check_config_ownership "$file"
+    check_cleanup_trap "$file" "$ftype"
+    check_error_stderr "$file"
+    check_input_validation "$file" "$ftype"
+    check_readonly "$file"
+    check_nameref "$file" "$ftype"
+    check_shopt_restore "$file"
+    check_function_naming "$file"
+    check_cli_conventions "$file" "$ftype"
+    check_dangerous_patterns "$file" "$ftype"
+    check_glob_safety "$file"
+}
+
+analyze_project() {
+    local project_root="$1"
+
+    [[ -d "$project_root" ]] || { echo "ERROR: ${project_root} is not a directory" >&2; return 1; }
+
+    # Track processed files to avoid duplicates
+    declare -A _PROCESSED=()
+
+    # Find all shell scripts
+    while IFS= read -r -d '' file; do
+        _PROCESSED["$file"]=1
+        analyze_file "$file"
+    done < <(find "$project_root/bin" "$project_root/lib" "$project_root/tests" \( -name '*.sh' -o -name '*.bash' \) -print0 2>/dev/null)
+
+    # Also scan entry points (bin/* without extension)
+    if [[ -d "$project_root/bin" ]]; then
+        while IFS= read -r -d '' file; do
+            # Skip if already processed
+            [[ -n "${_PROCESSED[$file]:-}" ]] && continue
+
+            # Check if it's a shell script
+            if head -1 "$file" 2>/dev/null | grep -qE '^#!.*bash'; then
+                analyze_file "$file"
+            fi
+        done < <(find "$project_root/bin" -maxdepth 1 -type f ! -name '*.py' -print0 2>/dev/null)
+    fi
+}
+
+# ── Output ─────────────────────────────────────────────────────────
+
+print_summary() {
+    local total_issues=$(( ${#ERRORS[@]} + ${#WARNINGS[@]} + ${#INFOS[@]} ))
+
+    if [[ $JSON_OUTPUT -eq 1 ]]; then
+        print_json
+        return
+    fi
+
+    # Print errors
+    if [[ ${#ERRORS[@]} -gt 0 ]]; then
+        echo -e "\n${BOLD}${RED}ERRORS:${NC}"
+        for msg in "${ERRORS[@]}"; do
+            echo -e "  ${RED}✗${NC} ${msg}"
+        done
+    fi
+
+    # Print warnings
+    if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        echo -e "\n${BOLD}${YELLOW}WARNINGS:${NC}"
+        for msg in "${WARNINGS[@]}"; do
+            echo -e "  ${YELLOW}⚠${NC} ${msg}"
+        done
+    fi
+
+    # Print info
+    if [[ ${#INFOS[@]} -gt 0 ]]; then
+        echo -e "\n${BOLD}${CYAN}INFO:${NC}"
+        for msg in "${INFOS[@]}"; do
+            echo -e "  ${CYAN}ℹ${NC} ${msg}"
+        done
+    fi
+
+    echo ""
+    echo "════════════════════════════════════"
+
+    if [[ ${#ERRORS[@]} -eq 0 && ${#WARNINGS[@]} -eq 0 ]]; then
+        echo -e " ${BOLD}All checks passed!${NC}"
+    else
+        echo -e " ${#ERRORS[@]} error(s), ${#WARNINGS[@]} warning(s), ${#INFOS[@]} info(s) — total: ${total_issues}"
+    fi
+    echo "════════════════════════════════════"
+}
+
+print_json() {
+    echo "{"
+    echo "  \"errors\": ["
+    local first=1
+    for msg in "${ERRORS[@]+"${ERRORS[@]}"}"; do
+        [[ $first -eq 0 ]] && echo ","
+        printf '    %s' "$(json_escape "$msg")"
+        first=0
+    done
+    echo ""
+    echo "  ],"
+    echo "  \"warnings\": ["
+    first=1
+    for msg in "${WARNINGS[@]+"${WARNINGS[@]}"}"; do
+        [[ $first -eq 0 ]] && echo ","
+        printf '    %s' "$(json_escape "$msg")"
+        first=0
+    done
+    echo ""
+    echo "  ],"
+    echo "  \"info\": ["
+    first=1
+    for msg in "${INFOS[@]+"${INFOS[@]}"}"; do
+        [[ $first -eq 0 ]] && echo ","
+        printf '    %s' "$(json_escape "$msg")"
+        first=0
+    done
+    echo ""
+    echo "  ]"
+    echo "}"
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    printf '"%s"' "$s"
+}
+
+# ── CLI parsing ────────────────────────────────────────────────────
+
+show_help() {
+    cat << EOF
+bash-lint v${VERSION} — linter for fkzys ecosystem bash projects
+
+Usage: bash-lint [OPTIONS] [FILES...]
+       bash-lint -p, --project DIR
+
+Checks shell scripts against ecosystem conventions (spec §0.1, §2, §7, §11).
+
+Options:
+    -p, --project DIR     Scan entire project (auto-discovers bin/, lib/, tests/)
+    --strict              Treat warnings as errors
+    --json                Output in JSON format
+    --quiet               Suppress INFO messages
+    -h, --help            Show this help
+    -V, --version         Show version
+
+Checks performed:
+  ERROR:
+    - Entry points: set -euo pipefail (spec §2)
+    - verify-lib sourcing (spec §2)
+    - No eval in config parsing (spec §2)
+    - ERROR/WARN messages to stderr (spec §2)
+    - No chmod 777 (spec §11)
+    - No hardcoded secrets (spec §11)
+
+  WARNING:
+    - _*_NO_INIT before sourcing library (spec §2)
+    - Config whitelist + printf -v (spec §2)
+    - Config ownership check (spec §2)
+    - Cleanup trap with set +e (spec §2)
+    - shopt save/restore (spec §2)
+    - Glob nullglob (spec §2)
+    - CLI --help/--version (spec §2)
+    - Input validation for paths (spec §2)
+    - Test files should not have -e (spec §7)
+    - Library functions building arrays without nameref (spec §2)
+    - Function naming: snake_case (spec §2)
+    - Sourcing without verify-lib wrapper (spec §2)
+    - Avoid /tmp for script files (spec §0.1)
+
+  INFO:
+    - Shebang convention (spec §2)
+    - Readonly constants (spec §2)
+
+Examples:
+    bash-lint -p ./atomic-upgrade
+    bash-lint --strict bin/atomic-upgrade lib/atomic/common.sh
+    bash-lint --json -p ./gitpkg | jq '.errors'
+EOF
+    exit 0
+}
+
+parse_args() {
+    local project_dir=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--project)
+                [[ -n "${2:-}" ]] || { echo "ERROR: -p/--project requires a directory argument" >&2; exit 1; }
+                project_dir="$2"; shift 2 ;;
+            --strict)
+                STRICT=1; shift ;;
+            --json)
+                JSON_OUTPUT=1; shift ;;
+            --quiet)
+                QUIET=1; shift ;;
+            -h|--help)
+                show_help ;;
+            -V|--version)
+                echo "bash-lint v${VERSION}"; exit 0 ;;
+            -*)
+                echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
+            *)
+                FILES+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ -n "$project_dir" ]]; then
+        analyze_project "$project_dir"
+        # Warn if positional files were also given (they are silently ignored)
+        if [[ ${#FILES[@]} -gt 0 ]]; then
+            echo "WARNING: file arguments ignored when using -p: ${FILES[*]}" >&2
+            echo "  Use either -p DIR or file list, not both" >&2
+        fi
+    elif [[ ${#FILES[@]} -gt 0 ]]; then
+        for f in "${FILES[@]}"; do
+            [[ -f "$f" ]] || { echo "ERROR: ${f}: no such file" >&2; continue; }
+            analyze_file "$f"
+        done
+    else
+        echo "ERROR: No files or project specified" >&2
+        echo "Usage: bash-lint [FILES...] or bash-lint -p DIR" >&2
+        exit 1
+    fi
+}
+
+# ── Entry ──────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+    print_summary
+
+    # Exit code: 1 if errors, or if strict mode and warnings exist
+    if [[ ${#ERRORS[@]} -gt 0 ]] || { [[ $STRICT -eq 1 ]] && [[ ${#WARNINGS[@]} -gt 0 ]]; }; then
+        exit 1
+    fi
+}
+
+main "$@"

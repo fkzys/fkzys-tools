@@ -1,0 +1,531 @@
+#!/bin/bash
+# fkzys-audit — project structure audit for fkzys ecosystem
+#
+# Checks project structure, CI, Makefiles, and language conventions
+# against the ecosystem specification (specs/README.md).
+#
+# Usage: fkzys-audit [OPTIONS] [DIR]
+#   --all               Show INFO-level suggestions
+#   --json              Output in JSON format
+#   --lang TYPE         Check only this language (bash, go, csharp, python)
+#   -h, --help          Show help
+#   -V, --version       Show version
+
+set -uo pipefail
+# Note: no -e. Audit must continue scanning all checks even when individual checks fail.
+
+readonly VERSION="0.1.0"
+
+# ── Output formatting ──────────────────────────────────────────────
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── State ──────────────────────────────────────────────────────────
+
+SHOW_ALL=0
+JSON_OUTPUT=0
+LANG_FILTER=""
+PROJECT_DIR=""
+
+declare -a ERRORS=()
+declare -a WARNINGS=()
+declare -a INFOS=()
+
+error()   { ERRORS+=("$1"); }
+warning() { WARNINGS+=("$1"); }
+info()    { [[ $SHOW_ALL -eq 0 ]] || INFOS+=("$1"); }
+
+# ── Helpers ────────────────────────────────────────────────────────
+
+has_file() { [[ -f "${PROJECT_DIR}/$1" ]]; }
+has_dir()  { [[ -d "${PROJECT_DIR}/$1" ]]; }
+file_contains() { grep -qE "$2" "${PROJECT_DIR}/$1" 2>/dev/null; }
+
+# ── Language detection ─────────────────────────────────────────────
+
+detect_language() {
+    # Go
+    if has_file "go.mod"; then echo "go"; return; fi
+    # C# / .NET
+    if compgen -G "${PROJECT_DIR}/*.csproj" > /dev/null 2>&1; then echo "csharp"; return; fi
+    # Python (has pyproject.toml or setup.py but no bin/*.sh as primary)
+    if has_file "pyproject.toml" || has_file "setup.py"; then
+        # Could be infra — check if it also has bin/ with .sh files
+        if has_dir "bin" && compgen -G "${PROJECT_DIR}/bin/*.sh" > /dev/null 2>&1; then
+            echo "bash"; return
+        fi
+        echo "python"; return
+    fi
+    # Shell: bin/ with shell scripts, depends file
+    if has_dir "bin" || has_file "depends"; then echo "bash"; return; fi
+    echo "unknown"
+}
+
+# ── Common checks (all languages) ─────────────────────────────────
+
+audit_license() {
+    if ! has_file "LICENSE"; then
+        warning "LICENSE:project should include a LICENSE file (spec §14)"
+    fi
+}
+
+audit_depends() {
+    local lang="$1"
+    # Go uses go.mod, not depends
+    [[ "$lang" == "go" ]] && return
+    # C# doesn't use depends
+    [[ "$lang" == "csharp" ]] && return
+
+    if has_file "depends"; then
+        # Validate format: system:pkg, gitpkg:pkg, or # comment
+        local bad_lines=""
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            if ! echo "$line" | grep -qE '^(system|gitpkg):[a-zA-Z0-9_.-]+$'; then
+                bad_lines+="$line"$'\n'
+            fi
+        done < "${PROJECT_DIR}/depends"
+        if [[ -n "$bad_lines" ]]; then
+            warning "depends:invalid format — expected 'system:pkg' or 'gitpkg:pkg' (spec §10)"
+        fi
+    fi
+}
+
+# ── Makefile checks ────────────────────────────────────────────────
+
+audit_makefile() {
+    local lang="$1"
+    has_file "Makefile" || return 0
+
+    local mf="Makefile"
+
+    # install target
+    if ! file_contains "$mf" '^install:'; then
+        warning "${mf}:MAKEFILE_INSTALL:Makefile should have an 'install' target (spec §3)"
+    fi
+
+    # test target (may be omitted for no-test projects)
+    if has_dir "tests" || has_dir "tests/" || compgen -G "${PROJECT_DIR}/tests/*" > /dev/null 2>&1; then
+        if ! file_contains "$mf" '^test:'; then
+            warning "${mf}:MAKEFILE_TEST:Makefile should have a 'test' target when tests exist (spec §3)"
+        fi
+    fi
+
+    # PREFIX should be /usr
+    if file_contains "$mf" '^PREFIX[[:space:]]*=[[:space:]]*/usr/local'; then
+        warning "${mf}:MAKEFILE_PREFIX:PREFIX should be /usr (not /usr/local) (spec §3)"
+    fi
+
+    # LICENSE install target
+    if file_contains "$mf" '^install:' && ! file_contains "$mf" 'LICENSE'; then
+        info "${mf}:MAKEFILE_LICENSE:Makefile install should include LICENSE (spec §3)"
+    fi
+}
+
+# ── CI checks ──────────────────────────────────────────────────────
+
+audit_ci() {
+    has_dir ".github/workflows" || return 0
+
+    local found_any=0
+    while IFS= read -r -d '' ci_file; do
+        found_any=1
+        local rel="${ci_file#${PROJECT_DIR}/}"
+
+        # Path filtering
+        if ! file_contains "$rel" 'paths:'; then
+            warning "${rel}:CI_PATHS:CI workflow should use 'paths' filter (spec §15)"
+        fi
+
+        # Should call test commands directly, not via make test
+        # Anchor to run step context to avoid matching comments/descriptions
+        if file_contains "$rel" '^\s+- run:.*make test|^\s*run:.*make test'; then
+            warning "${rel}:CI_MAKE_TEST:CI should call test commands directly (spec §15)"
+        fi
+    done < <(find "${PROJECT_DIR}/.github/workflows" -name '*.yml' -print0 2>/dev/null)
+
+    if [[ "$found_any" -eq 0 ]]; then
+        info ".github/workflows/:no CI workflow files found"
+    fi
+}
+
+# ── Test documentation ─────────────────────────────────────────────
+
+audit_test_docs() {
+    local lang="$1"
+
+    case "$lang" in
+        go|csharp)
+            # Uses tests.md at root
+            if ! has_file "tests.md"; then
+                if has_dir "tests" || has_file "go.mod" || compgen -G "${PROJECT_DIR}/*.csproj" > /dev/null 2>&1; then
+                    info "tests.md:consider adding tests.md for test documentation (spec §7)"
+                fi
+            fi
+            ;;
+        bash|python|unknown)
+            # Uses tests/README.md
+            if has_dir "tests" && ! has_file "tests/README.md"; then
+                info "tests/README.md:consider adding tests/README.md (spec §7)"
+            fi
+            ;;
+    esac
+}
+
+# ── Shell-specific checks ──────────────────────────────────────────
+
+audit_shell_project() {
+    # Entry points: bin/*.sh or bin/* (no extension)
+    if has_dir "bin"; then
+        while IFS= read -r -d '' entry; do
+            audit_shell_entry "$entry"
+        done < <(find "${PROJECT_DIR}/bin" -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+
+    # Libraries
+    if has_dir "lib"; then
+        while IFS= read -r -d '' lib; do
+            audit_shell_library "$lib"
+        done < <(find "${PROJECT_DIR}/lib" -name '*.sh' -print0 2>/dev/null)
+    fi
+
+    # CLI tools should have man pages and completions
+    if has_dir "bin"; then
+        local bin_count
+        bin_count=$(find "${PROJECT_DIR}/bin" -maxdepth 1 -type f 2>/dev/null | wc -l)
+        if [[ "$bin_count" -gt 0 ]]; then
+            # Man pages
+            if ! has_dir "man"; then
+                info "man/:CLI tools should provide man pages (spec §8.1)"
+            fi
+            # Completions
+            if ! has_dir "completions"; then
+                info "completions/:CLI tools should provide shell completions (spec §8)"
+            fi
+        fi
+    fi
+
+    # test_harness.sh (suggestion)
+    if has_dir "tests" && ! has_file "tests/test_harness.sh"; then
+        info "tests/test_harness.sh:consider adding test_harness.sh (spec §7)"
+    fi
+}
+
+audit_shell_entry() {
+    local file="$1"
+    local rel="${file#${PROJECT_DIR}/}"
+    local first
+    first="$(head -1 "$file" 2>/dev/null || true)"
+
+    # Shebang
+    if [[ "$first" != "#!/bin/bash" ]]; then
+        warning "${rel}:ENTRY_SHEBANG:entry point should use '#!/bin/bash' (spec §2)"
+    fi
+
+    # set -euo pipefail
+    if ! grep -qE '^set -euo pipefail$' "$file" 2>/dev/null; then
+        local set_line=""
+        set_line=$(grep -nE '^set -[a-z]+' "$file" 2>/dev/null | head -1 || true)
+        if [[ -n "$set_line" ]]; then
+            local ln actual next_line
+            ln=$(echo "$set_line" | cut -d: -f1)
+            actual=$(echo "$set_line" | cut -d: -f2-)
+            next_line=$(sed -n "$((ln + 1))p" "$file")
+            if echo "$actual $next_line" | grep -qiE '(guard|guard script|errexit|set -e|no -e)'; then
+                : # guard script — allowed omission (spec §2)
+            else
+                warning "${rel}:ENTRY_STRICTNESS:entry point should use 'set -euo pipefail' (spec §2)"
+            fi
+        else
+            # No set -... at all — check for guard script comment in header
+            local header
+            header=$(head -15 "$file" 2>/dev/null || true)
+            if ! echo "$header" | grep -qiE '(guard script|guard hook|no.*set -euo|no.*errexit|breaks? with errexit)'; then
+                warning "${rel}:ENTRY_STRICTNESS:entry point should use 'set -euo pipefail' (spec §2)"
+            fi
+        fi
+    fi
+}
+
+audit_shell_library() {
+    local file="$1"
+    local rel="${file#${PROJECT_DIR}/}"
+    local first
+    first="$(head -1 "$file" 2>/dev/null || true)"
+
+    # Shebang
+    if [[ "$first" != "#!/usr/bin/env bash" ]]; then
+        warning "${rel}:LIB_SHEBANG:library should use '#!/usr/bin/env bash' (spec §2)"
+    fi
+}
+
+# ── Go-specific checks ─────────────────────────────────────────────
+
+audit_go() {
+    # cmd/ directory
+    if ! has_dir "cmd"; then
+        warning "cmd/:Go projects should use cmd/<name>/ for entry points (spec §6)"
+    fi
+
+    # internal/ directory
+    if ! has_dir "internal"; then
+        info "internal/:Go projects SHOULD use internal/ for private packages (spec §6)"
+    fi
+
+    # Build flags in Makefile — only warn if Makefile actually has a go build command
+    if has_file "Makefile"; then
+        if file_contains "Makefile" 'go build|go install'; then
+            if ! file_contains "Makefile" 'CGO_ENABLED=0'; then
+                warning "Makefile:GO_BUILD_FLAGS:Go build should use CGO_ENABLED=0 -trimpath -buildmode=pie (spec §6)"
+            fi
+        fi
+    fi
+}
+
+# ── C#-specific checks ─────────────────────────────────────────────
+
+audit_csharp() {
+    # .csproj files
+    local csproj
+    csproj=$(find "${PROJECT_DIR}" -name '*.csproj' -maxdepth 2 2>/dev/null | head -1)
+    if [[ -z "$csproj" ]]; then
+        warning "*.csproj:No C# project file found"
+        return
+    fi
+
+    # Tests project
+    if ! find "${PROJECT_DIR}" -name '*.Tests.csproj' -maxdepth 2 2>/dev/null | grep -q .; then
+        info "*.Tests.csproj:consider adding a xUnit test project (spec §13)"
+    fi
+}
+
+# ── Python-specific checks ─────────────────────────────────────────
+
+audit_python() {
+    # __main__.py for CLI tools
+    if has_dir "bin"; then
+        # Check if there's a Python package
+        if compgen -G "${PROJECT_DIR}"/*.py > /dev/null 2>&1 || has_file "pyproject.toml"; then
+            if ! find "${PROJECT_DIR}" -name '__main__.py' 2>/dev/null | grep -q .; then
+                info "__main__.py:CLI tools should provide __main__.py for 'python -m' support (spec §4)"
+            fi
+        fi
+    fi
+}
+
+# ── Main audit ─────────────────────────────────────────────────────
+
+run_audit() {
+    local lang
+    lang="$(detect_language)"
+
+    # Override with filter if specified
+    if [[ -n "$LANG_FILTER" ]]; then
+        lang="$LANG_FILTER"
+    fi
+
+    # Common checks
+    audit_license
+    audit_depends "$lang"
+    audit_makefile "$lang"
+    audit_ci
+    audit_test_docs "$lang"
+
+    # Language-specific
+    case "$lang" in
+        bash)     audit_shell_project ;;
+        go)       audit_go ;;
+        csharp)   audit_csharp ;;
+        python)   audit_python ;;
+        unknown)  warning "structure:unknown language — could not detect project type (bin/, go.mod, *.csproj, pyproject.toml)" ;;
+    esac
+}
+
+# ── Output ─────────────────────────────────────────────────────────
+
+print_summary() {
+    local total_issues=$(( ${#ERRORS[@]} + ${#WARNINGS[@]} + ${#INFOS[@]} ))
+
+    if [[ $JSON_OUTPUT -eq 1 ]]; then
+        print_json
+        return
+    fi
+
+    # Print errors
+    if [[ ${#ERRORS[@]} -gt 0 ]]; then
+        echo -e "\n${BOLD}${RED}ERRORS:${NC}"
+        for msg in "${ERRORS[@]}"; do
+            echo -e "  ${RED}✗${NC} ${msg}"
+        done
+    fi
+
+    # Print warnings
+    if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        echo -e "\n${BOLD}${YELLOW}WARNINGS:${NC}"
+        for msg in "${WARNINGS[@]}"; do
+            echo -e "  ${YELLOW}⚠${NC} ${msg}"
+        done
+    fi
+
+    # Print info
+    if [[ ${#INFOS[@]} -gt 0 ]]; then
+        echo -e "\n${BOLD}${CYAN}INFO:${NC}"
+        for msg in "${INFOS[@]}"; do
+            echo -e "  ${CYAN}ℹ${NC} ${msg}"
+        done
+    fi
+
+    echo ""
+    echo "════════════════════════════════════"
+
+    if [[ ${#ERRORS[@]} -eq 0 && ${#WARNINGS[@]} -eq 0 ]]; then
+        echo -e " ${BOLD}All checks passed!${NC}"
+    else
+        echo -e " ${#ERRORS[@]} error(s), ${#WARNINGS[@]} warning(s), ${#INFOS[@]} info(s) — total: ${total_issues}"
+    fi
+    echo "════════════════════════════════════"
+}
+
+print_json() {
+    echo "{"
+    echo "  \"errors\": ["
+    local first=1
+    for msg in "${ERRORS[@]+"${ERRORS[@]}"}"; do
+        [[ $first -eq 0 ]] && echo ","
+        printf '    "%s"' "$(json_escape "$msg")"
+        first=0
+    done
+    echo ""
+    echo "  ],"
+    echo "  \"warnings\": ["
+    first=1
+    for msg in "${WARNINGS[@]+"${WARNINGS[@]}"}"; do
+        [[ $first -eq 0 ]] && echo ","
+        printf '    "%s"' "$(json_escape "$msg")"
+        first=0
+    done
+    echo ""
+    echo "  ],"
+    echo "  \"info\": ["
+    first=1
+    for msg in "${INFOS[@]+"${INFOS[@]}"}"; do
+        [[ $first -eq 0 ]] && echo ","
+        printf '    "%s"' "$(json_escape "$msg")"
+        first=0
+    done
+    echo ""
+    echo "  ]"
+    echo "}"
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    printf '%s' "$s"
+}
+
+# ── CLI parsing ────────────────────────────────────────────────────
+
+show_help() {
+    cat << EOF
+fkzys-audit v${VERSION} — project structure audit for fkzys ecosystem
+
+Usage: fkzys-audit [OPTIONS] [DIR]
+
+Checks project structure, CI, Makefiles, and language conventions
+against the ecosystem specification (specs/README.md).
+
+Options:
+    --all               Show INFO-level suggestions
+    --json              Output in JSON format
+    --lang TYPE         Check only this language (bash, go, csharp, python)
+    -h, --help          Show this help
+    -V, --version       Show version
+
+Checks performed:
+  Common:
+    - LICENSE file (spec §14)
+    - depends format (spec §10)
+    - Makefile targets: install, test, PREFIX=/usr (spec §3)
+    - CI: paths filter, direct test calls (spec §15)
+    - Test documentation: tests/README.md or tests.md (spec §7)
+
+  Language-specific:
+    Bash:
+    - Entry points: shebang, set -euo pipefail (spec §2)
+    - Libraries: #!/usr/bin/env bash (spec §2)
+    - man pages, completions (spec §8, §8.1)
+    - test_harness.sh (spec §7)
+
+    Go:
+    - cmd/<name>/ entry points (spec §6)
+    - internal/ private packages (spec §6)
+    - Build flags: CGO_ENABLED=0, -trimpath (spec §6)
+
+    C#:
+    - .csproj structure (spec §13)
+    - xUnit test project (spec §13)
+
+    Python:
+    - __main__.py for CLI tools (spec §4)
+EOF
+    exit 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                SHOW_ALL=1; shift ;;
+            --json)
+                JSON_OUTPUT=1; shift ;;
+            --lang)
+                [[ -n "${2:-}" ]] || { echo "ERROR: --lang requires a value (bash, go, csharp, python)" >&2; exit 1; }
+                case "$2" in
+                    bash|go|csharp|python) LANG_FILTER="$2"; shift 2 ;;
+                    *) echo "ERROR: --lang must be one of: bash, go, csharp, python" >&2; exit 1 ;;
+                esac ;;
+            -h|--help)
+                show_help ;;
+            -V|--version)
+                echo "fkzys-audit v${VERSION}"; exit 0 ;;
+            -*)
+                echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
+            *)
+                PROJECT_DIR="$1"; shift ;;
+        esac
+    done
+
+    # Default to current directory
+    if [[ -z "$PROJECT_DIR" ]]; then
+        PROJECT_DIR="."
+    fi
+
+    # Resolve to absolute path
+    PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+
+    [[ -d "$PROJECT_DIR" ]] || { echo "ERROR: ${PROJECT_DIR} is not a directory" >&2; exit 1; }
+
+    run_audit
+}
+
+# ── Entry ──────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+    print_summary
+
+    [[ ${#ERRORS[@]} -eq 0 ]] || exit 1
+}
+
+main "$@"

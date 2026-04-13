@@ -1,0 +1,445 @@
+#!/bin/bash
+# bash-coverage — test coverage for fkzys ecosystem bash projects
+#
+# Measures which lines of bash scripts are executed during test runs.
+# Uses BASH_ENV + DEBUG trap — no source file modifications needed.
+#
+# Usage: bash-coverage [OPTIONS] -- COMMAND...
+#   -p, --project DIR     Project root (auto-discovers test scripts in tests/)
+#   -r, --report FILE     Write coverage report to FILE (default: stdout)
+#   --include PATTERN     Only track files matching regex pattern
+#   --exclude PATTERN     Exclude files matching regex pattern
+#   --min-coverage PCT    Exit 1 if coverage below threshold
+#   -h, --help            Show help
+#   -V, --version         Show version
+#
+# Examples:
+#   bash-coverage -- bash tests/test_config.sh
+#   bash-coverage -p ./atomic-upgrade        # auto-runs all tests in tests/
+#   bash-coverage --include 'common\.sh' -- bash tests/test.sh
+#   bash-coverage --min-coverage 80 -- make test
+
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+
+# ── Output formatting ──────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── State ──────────────────────────────────────────────────────────
+
+COVERAGE_DIR=""
+COVERAGE_FILE=""
+REPORT_FILE=""
+INCLUDE_PATTERN=""
+EXCLUDE_PATTERN=""
+MIN_COVERAGE=""
+PROJECT_DIR=""
+declare -a CMD=()
+
+# ── Cleanup ────────────────────────────────────────────────────────
+
+cleanup() {
+    set +e
+    [[ -n "$COVERAGE_DIR" && -d "$COVERAGE_DIR" ]] && rm -rf "$COVERAGE_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# ── Report generation ──────────────────────────────────────────────
+
+generate_report() {
+    local coverage_file="$1"
+
+    if [[ ! -f "$coverage_file" ]] || [[ ! -s "$coverage_file" ]]; then
+        echo "No coverage data collected." >&2
+        return 1
+    fi
+
+    # Get unique file:line pairs (deduplicated)
+    local -A file_covered=()
+    local -A seen_lines=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local file="${line%:*}"
+        local lineno="${line##*:}"
+        local key="${file}:${lineno}"
+        [[ -n "${seen_lines[$key]:-}" ]] && continue
+        seen_lines["$key"]=1
+        file_covered["$file"]+="${lineno} "
+    done < "$coverage_file"
+
+    # Resolve PROJECT_DIR to absolute for reliable prefix stripping
+    local abs_project_dir=""
+    if [[ -n "${PROJECT_DIR:-}" && "$PROJECT_DIR" != /* ]]; then
+        abs_project_dir="$(realpath -m "$PROJECT_DIR" 2>/dev/null)" || abs_project_dir=""
+    else
+        abs_project_dir="${PROJECT_DIR:-}"
+    fi
+
+    # Normalize paths to absolute
+    local -A file_covered_normalized=()
+    for file in "${!file_covered[@]}"; do
+        local normalized="$file"
+        if [[ "$file" != /* ]]; then
+            if [[ -n "$abs_project_dir" ]]; then
+                normalized="$(realpath -m "$abs_project_dir/$file" 2>/dev/null)" || continue
+            else
+                normalized="$(realpath -m "$file" 2>/dev/null)" || continue
+            fi
+        fi
+        # Skip test files (they are the runners, not the target)
+        [[ "$normalized" == */tests/* ]] && continue
+        [[ "$normalized" == */test_*.sh ]] && continue
+        [[ "$normalized" == *"/coverage-init.sh" ]] && continue
+        file_covered_normalized["$normalized"]="${file_covered[$file]}"
+    done
+
+    # Collect sorted file list (keep absolute paths as keys)
+    local -a sorted_files=()
+    for file in "${!file_covered_normalized[@]}"; do
+        sorted_files+=("$file")
+    done
+    if [[ ${#sorted_files[@]} -gt 0 ]]; then
+        mapfile -t sorted_files < <(printf '%s\n' "${sorted_files[@]}" | sort)
+    fi
+
+    # Calculate coverage
+    local total_files=0
+    local total_lines=0
+    local total_covered=0
+    local -a results=()
+
+    for file in "${sorted_files[@]}"; do
+        [[ -z "$file" ]] && continue
+        [[ -f "$file" ]] || continue
+
+        local covered_list="${file_covered_normalized["$file"]}"
+        read -ra covered_arr <<< "$covered_list"
+        local covered_count=${#covered_arr[@]}
+
+        # Count executable lines (exclude blanks, comments, structural keywords)
+        local exec_lines
+        exec_lines=$(awk 'NF && !/^[[:space:]]*#/ && !/^[[:space:]]*(then|fi|do|done|esac|else|elif|in|;;|\)|\{|\})[[:space:]]*$/' "$file" 2>/dev/null | wc -l)
+        exec_lines=$((exec_lines + 0))
+
+        local pct=0
+        [[ $exec_lines -gt 0 ]] && pct=$((covered_count * 100 / exec_lines))
+
+        total_files=$((total_files + 1))
+        total_lines=$((total_lines + exec_lines))
+        total_covered=$((total_covered + covered_count))
+
+        # Compute relative path from project dir (or cwd)
+        local display_path="$file"
+        if [[ -n "$abs_project_dir" && "$file" == "${abs_project_dir}/"* ]]; then
+            display_path="${file#"${abs_project_dir}/"}"
+        else
+            display_path="${file#"$(pwd)/"}"
+        fi
+
+        results+=("${display_path}|${covered_count}|${exec_lines}|${pct}")
+        # Track max path length for column alignment
+        if [[ ${#display_path} -gt ${max_path_len:-0} ]]; then
+            max_path_len=${#display_path}
+        fi
+    done
+
+    # Print report
+    print_coverage_report "${max_path_len:-4}" "${results[@]}"
+    echo ""
+
+    local overall_pct=0
+    [[ $total_lines -gt 0 ]] && overall_pct=$((total_covered * 100 / total_lines))
+
+    echo "════════════════════════════════════"
+    if [[ $overall_pct -ge 80 ]]; then
+        echo -e " Overall coverage: ${BOLD}${GREEN}${overall_pct}%${NC} (${total_covered}/${total_lines} lines in ${total_files} files)"
+    elif [[ $overall_pct -ge 50 ]]; then
+        echo -e " Overall coverage: ${BOLD}${YELLOW}${overall_pct}%${NC} (${total_covered}/${total_lines} lines in ${total_files} files)"
+    else
+        echo -e " Overall coverage: ${BOLD}${RED}${overall_pct}%${NC} (${total_covered}/${total_lines} lines in ${total_files} files)"
+    fi
+    echo "════════════════════════════════════"
+
+    if [[ -n "$MIN_COVERAGE" && $overall_pct -lt $MIN_COVERAGE ]]; then
+        echo -e "${RED}Coverage ${overall_pct}% is below minimum ${MIN_COVERAGE}%${NC}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+print_coverage_report() {
+    local max_path_len="$1"; shift
+    local -a results=("$@")
+
+    echo ""
+    echo -e "${BOLD}Coverage Report:${NC}"
+    echo ""
+
+    # Build header/footer separators of correct width
+    local path_header="FILE"
+    local path_sep=""
+    printf -v path_sep '%*s' "$max_path_len" ''
+    path_sep="${path_sep// /-}"
+
+    printf "  %-${max_path_len}s %8s %8s %6s\n" "$path_header" "COVERED" "TOTAL" "COV%"
+    printf "  %-${max_path_len}s %8s %8s %6s\n" "$path_sep" "-------" "-----" "----"
+
+    local sorted=""
+    for r in "${results[@]}"; do
+        sorted+="${r}"$'\n'
+    done
+    sorted=$(echo "$sorted" | sort -t'|' -k4 -n)
+
+    while IFS='|' read -r file covered total pct; do
+        [[ -z "$file" ]] && continue
+
+        local color=""
+        if [[ $pct -ge 80 ]]; then
+            color="$GREEN"
+        elif [[ $pct -ge 50 ]]; then
+            color="$YELLOW"
+        else
+            color="$RED"
+        fi
+
+        printf "  %-${max_path_len}s %8d %8d ${color}%5d%%${NC}\n" "$file" "$covered" "$total" "$pct"
+    done <<< "$sorted"
+}
+
+# ── Project auto-discovery ─────────────────────────────────────────
+
+discover_test_command() {
+    local project_root="$1"
+
+    if [[ -d "${project_root}/tests" ]]; then
+        find "${project_root}/tests" \( -name 'test_*.sh' -o -name 'test.sh' \) 2>/dev/null | sort
+    fi
+}
+
+# ── CLI parsing ────────────────────────────────────────────────────
+
+show_help() {
+    cat << EOF
+bash-coverage v${VERSION} — test coverage for fkzys ecosystem bash projects
+
+Usage: bash-coverage [OPTIONS] -- COMMAND...
+       bash-coverage -p, --project DIR [-- COMMAND...]
+
+Measures which lines of bash scripts are executed during test runs.
+Uses BASH_ENV + DEBUG trap — no source file modifications needed.
+
+Options:
+    -p, --project DIR     Project root (auto-discovers test scripts in tests/)
+    -r, --report FILE     Write coverage report to FILE (default: stdout)
+    --include PATTERN     Only track files matching regex pattern
+    --exclude PATTERN     Exclude files matching regex pattern
+    --min-coverage PCT    Exit 1 if coverage below threshold (0-100)
+    -h, --help            Show this help
+    -V, --version         Show version
+
+Examples:
+    bash-coverage -- bash tests/test_config.sh
+    bash-coverage -p ./atomic-upgrade        # auto-runs all tests
+    bash-coverage --include 'common\.sh' -- bash tests/test.sh
+    bash-coverage --min-coverage 80 -- make test
+
+Output:
+    Coverage per file with color coding:
+    - GREEN  (≥80%): good coverage
+    - YELLOW (≥50%): moderate coverage
+    - RED    (<50%): low coverage
+EOF
+    exit 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--project)
+                [[ -n "${2:-}" ]] || { echo "ERROR: -p/--project requires a directory argument" >&2; exit 1; }
+                PROJECT_DIR="$2"; shift 2 ;;
+            -r|--report)
+                [[ -n "${2:-}" ]] || { echo "ERROR: -r/--report requires a FILE argument" >&2; exit 1; }
+                REPORT_FILE="${2}"; shift 2 ;;
+            --include)
+                [[ -n "${2:-}" ]] || { echo "ERROR: --include requires a PATTERN argument" >&2; exit 1; }
+                INCLUDE_PATTERN="${2}"; shift 2 ;;
+            --exclude)
+                [[ -n "${2:-}" ]] || { echo "ERROR: --exclude requires a PATTERN argument" >&2; exit 1; }
+                EXCLUDE_PATTERN="${2}"; shift 2 ;;
+            --min-coverage)
+                [[ -n "${2:-}" ]] || { echo "ERROR: --min-coverage requires a value" >&2; exit 1; }
+                if ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -gt 100 ]]; then
+                    echo "ERROR: --min-coverage must be an integer 0-100" >&2; exit 1
+                fi
+                MIN_COVERAGE="$2"; shift 2 ;;
+            --)
+                shift
+                CMD=("$@")
+                break
+                ;;
+            -h|--help)
+                show_help ;;
+            -V|--version)
+                echo "bash-coverage v${VERSION}"; exit 0 ;;
+            -*)
+                echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
+            *)
+                CMD=("$@")
+                break
+                ;;
+        esac
+    done
+
+    if [[ -n "$PROJECT_DIR" && ${#CMD[@]} -eq 0 ]]; then
+        echo -e "${CYAN}Auto-discovering test files for project: ${PROJECT_DIR}${NC}"
+        local -a discovered=()
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            discovered+=("$f")
+        done < <(discover_test_command "$PROJECT_DIR")
+
+        if [[ ${#discovered[@]} -eq 0 ]]; then
+            echo "ERROR: Could not discover test files for ${PROJECT_DIR}" >&2
+            echo "Specify manually: bash-coverage -p DIR -- COMMAND..." >&2
+            exit 1
+        fi
+
+        # Single coverage dir for all tests
+        COVERAGE_DIR=$(mktemp -d)
+        COVERAGE_FILE="${COVERAGE_DIR}/coverage.log"
+        touch "$COVERAGE_FILE"
+
+        local init_script="${COVERAGE_DIR}/coverage-init.sh"
+        cat > "$init_script" << 'INITEOF'
+_coverage_log() {
+    set +T
+    local file="${BASH_SOURCE[1]:-}"
+    local line="${BASH_LINENO[0]:-}"
+    [[ -n "$file" && -n "$line" && -f "$file" ]] || { set -T; return; }
+    if [[ -n "${COV_INCLUDE:-}" && ! "$file" =~ $COV_INCLUDE ]]; then
+        set -T; return
+    fi
+    if [[ -n "${COV_EXCLUDE:-}" && "$file" =~ $COV_EXCLUDE ]]; then
+        set -T; return
+    fi
+    echo "${file}:${line}" >> "$COV_LOG"
+    set -T
+}
+trap '_coverage_log' DEBUG
+set -T
+INITEOF
+
+        export BASH_ENV="$init_script"
+        export COV_LOG="$COVERAGE_FILE"
+        export COV_INCLUDE="$INCLUDE_PATTERN"
+        export COV_EXCLUDE="$EXCLUDE_PATTERN"
+
+        local worst_rc=0
+        for f in "${discovered[@]}"; do
+            echo -e "${CYAN}Running:${NC} bash ${f}"
+            echo -e "${CYAN}Collecting coverage...${NC}"
+            set +e
+            bash "$f"
+            local rc=$?
+            set -e
+            (( rc > worst_rc )) && worst_rc=$rc
+            echo -e "${CYAN}Coverage collection complete (exit: ${rc}).${NC}"
+            echo ""
+        done
+
+        unset BASH_ENV COV_LOG COV_INCLUDE COV_EXCLUDE
+
+        if [[ -n "$REPORT_FILE" ]]; then
+            generate_report "$COVERAGE_FILE" > "$REPORT_FILE"
+            echo -e "${CYAN}Report written to:${NC} ${REPORT_FILE}"
+        else
+            generate_report "$COVERAGE_FILE"
+        fi
+
+        return $worst_rc
+    elif [[ ${#CMD[@]} -gt 0 ]]; then
+        run_coverage_command "${CMD[@]}"
+    else
+        echo "ERROR: No command specified" >&2
+        echo "Usage: bash-coverage -- COMMAND..." >&2
+        exit 1
+    fi
+}
+
+run_coverage_command() {
+    # Accept array directly — no eval, no string joining
+    CMD=("$@")
+
+    COVERAGE_DIR=$(mktemp -d)
+    COVERAGE_FILE="${COVERAGE_DIR}/coverage.log"
+    touch "$COVERAGE_FILE"
+
+    local init_script="${COVERAGE_DIR}/coverage-init.sh"
+    cat > "$init_script" << 'INITEOF'
+_coverage_log() {
+    set +T
+    local file="${BASH_SOURCE[1]:-}"
+    local line="${BASH_LINENO[0]:-}"
+    [[ -n "$file" && -n "$line" && -f "$file" ]] || { set -T; return; }
+    if [[ -n "${COV_INCLUDE:-}" && ! "$file" =~ $COV_INCLUDE ]]; then
+        set -T; return
+    fi
+    if [[ -n "${COV_EXCLUDE:-}" && "$file" =~ $COV_EXCLUDE ]]; then
+        set -T; return
+    fi
+    echo "${file}:${line}" >> "$COV_LOG"
+    set -T
+}
+trap '_coverage_log' DEBUG
+set -T
+INITEOF
+
+    echo -e "${CYAN}Collecting coverage...${NC}"
+
+    export BASH_ENV="$init_script"
+    export COV_LOG="$COVERAGE_FILE"
+    export COV_INCLUDE="$INCLUDE_PATTERN"
+    export COV_EXCLUDE="$EXCLUDE_PATTERN"
+
+    # Run command directly — no eval, preserves spaces in paths
+    set +e
+    "${CMD[@]}"
+    local rc=$?
+    set -e
+
+    unset BASH_ENV COV_LOG COV_INCLUDE COV_EXCLUDE
+
+    echo -e "${CYAN}Coverage collection complete (exit: ${rc}).${NC}"
+    echo ""
+
+    if [[ -n "$REPORT_FILE" ]]; then
+        generate_report "$COVERAGE_FILE" > "$REPORT_FILE"
+        echo -e "${CYAN}Report written to:${NC} ${REPORT_FILE}"
+    else
+        generate_report "$COVERAGE_FILE"
+    fi
+    local report_rc=$?
+
+    # Return test command exit code (report generation failure is secondary)
+    return $(( rc != 0 ? rc : report_rc ))
+}
+
+# ── Entry ──────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+}
+
+main "$@"
