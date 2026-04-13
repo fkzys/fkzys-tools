@@ -19,5 +19,14 @@ uninstall:
 	rm -f  $(DESTDIR)$(BINDIR)/fkzys-audit
 	rm -rf $(DESTDIR)$(LICENSEDIR)/
 
+UNIT_TESTS = \
+	tests/test_bash_lint.sh \
+	tests/test_fkzys_audit.sh \
+	tests/test_bash_coverage.sh
+
 test:
-	fail=0; bash tests/test_bash_lint.sh || fail=1; bash tests/test_fkzys_audit.sh || fail=1; bash tests/test_bash_coverage.sh || fail=1; exit $$fail
+	@for t in $(UNIT_TESTS); do \
+		echo ""; \
+		echo "━━━ $$t ━━━"; \
+		bash "$$t" || exit 1; \
+	done
